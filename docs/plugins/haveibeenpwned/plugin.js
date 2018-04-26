@@ -699,7 +699,7 @@ ListView.prototype.render = function () {
 /**
  * Replaces initial getEntriesByFilter in AppModel
  * Check all entries to see if they are pawned
- * @param {Filter} filter 
+ * @param {Filter} filter
  */
 AppModel.prototype.getEntriesByFilter = function (filter) {
     const entries = appModelGetEntriesByFilter.apply(this, arguments);
@@ -741,7 +741,7 @@ module.exports.getSettings = function () {
 
 /**
  * Take settings changes into account
- * @param {Settings array} changes 
+ * @param {Settings array} changes
  */
 module.exports.setSettings = function (changes) {
     for (const field in changes) {
