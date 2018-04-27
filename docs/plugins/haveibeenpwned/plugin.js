@@ -207,9 +207,9 @@ class HIBP {
         this.cache = new StorageCache();
         this.loadCache('_pwnedNamesCache');
         this.loadCache('_pwnedPwdsCache');
-        // starts checking names & pwds asynchronously 
+        // starts checking names & pwds asynchronously
         // do somme throttling on names as HIBP does not allow more than one call every 1500 millisecs
-        let throttle = 2000; // millisecs betwwen 2 calls
+        const throttle = 2000; // millisecs betwwen 2 calls
         // names and pwds waiting to be checked
         this.waitingNames = [];
         this.waitingPwds = [];
@@ -640,14 +640,14 @@ class HIBP {
                         item.namePwned = breaches;
                         refresh = refresh || (!breaches !== !itemPwned); // XOR
                     });
-                    refresh && app.refresh();
+                    refresh && this.appModel.refresh();
                 })
                 .catch(err => {
                     hLogger.error('error in checking name ' + elem.name + ' in checkNextWaitingElems: ' + err);
                 });
         }
         if (this.waitingPwds.length) {
-            const elem = pwds.shift();
+            const elem = this.waitingPwds.shift();
             this.sha1(elem.pwd)
                 .then(hpwd => {
                     return this.checkPwdPwned(hpwd);
@@ -659,7 +659,7 @@ class HIBP {
                         item.pwdPwned = nb;
                         refresh = refresh || (!nb !== !itemPwned); // XOR
                     });
-                    refresh && app.refresh();
+                    refresh && this.appModel.refresh();
                 })
                 .catch(err => {
                     hLogger.error('error in checking pwd ' + elem.pwd + ' in checkNextWaitingElems: ' + err);
