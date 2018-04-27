@@ -11,7 +11,8 @@ const Logger = require('util/logger');
  */
 const hLogger = new Logger('HaveIBeenPwned');
 /** change log level here. Should be changed to Info when issue #893 fixed on keeweb */
-hLogger.setLevel(Logger.Level.Debug);
+const HLoggerDebug = Logger.Level.All;
+hLogger.setLevel(HLoggerDebug - 1);
 
 /**
  * Cache time to live
@@ -206,6 +207,16 @@ class HIBP {
         this.cache = new StorageCache();
         this.loadCache('_pwnedNamesCache');
         this.loadCache('_pwnedPwdsCache');
+        // starts checking names & pwds asynchronously 
+        // do somme throttling on names as HIBP does not allow more than one call every 1500 millisecs
+        let throttle = 2000; // millisecs betwwen 2 calls
+        // names and pwds waiting to be checked
+        this.waitingNames = [];
+        this.waitingPwds = [];
+        this.appModel = null;
+        setInterval(() => {
+            this.checkNextWaitingElems();
+        }, throttle);
     }
     /**
      * Show the details of an entry in debug mode
@@ -311,7 +322,7 @@ class HIBP {
      * Checks if the input name is pawned in breaches on haveibeenpwned.
      * Uses a cache to avoid calling hibp again and again with the same values
      * @param {string} name the name to check
-     * @returns {Promise} a promise resolving to an html string containing a list of breaches names if pwned, or null
+     * @returns {Promise} a promise resolving to an html string containing a list of breaches names if pwned, or null if either being checked or not breached
      */
     checkNamePwned (uname) {
         hLogger.debug('checking user name ' + uname);
@@ -321,6 +332,8 @@ class HIBP {
             return Promise.resolve(this._pwnedNamesCache[name].val);
         } else {
             hLogger.debug('USER NAME NOT FOUND in cache: ' + name); // + ' cache=' + this.stringify(this._pwnedNamesCache));
+            // store the name in cache with a null value so that we don't ask multiple times the same name
+            this._pwnedNamesCache[name] = { date: Date.now(), val: null };
             const url = `https://haveibeenpwned.com/api/v2/breachedaccount/${name}?truncateResponse=true`;
             // hLogger.debug('url ' + url);
             return HIBPUtils.xhrpromise({
@@ -341,6 +354,10 @@ class HIBP {
                 if (breaches) hLogger.info(`name ${name} pwned in ${breaches}`);
                 this.storeCache('_pwnedNamesCache');
                 return breaches;
+            }).catch(error => {
+                hLogger.error('check pwned name error: ' + error.message);
+                // reset cache to unknown
+                this._pwnedNamesCache[name] = undefined;
             });
         }
     };
@@ -360,6 +377,8 @@ class HIBP {
             return Promise.resolve(val);
         } else {
             hLogger.debug('PWD NOT FOUND in cache: ' + passwordHash); // + ' cache=' + this.stringify(this._pwnedPwdsCache));
+            // store the pwd in cache with a null value so that we don't ask multiple times the same pwd
+            this._pwnedPwdsCache[passwordHash] = { date: Date.now(), val: null };
             return HIBPUtils.xhrpromise({
                 url: `https://api.pwnedpasswords.com/range/${prefix}`,
                 method: 'GET',
@@ -385,6 +404,10 @@ class HIBP {
                 if (nb) hLogger.info(`password ${passwordHash} pawned ${nb} times`);
                 this.storeCache('_pwnedPwdsCache');
                 return nb;
+            }).catch(error => {
+                hLogger.error('check pwned password error: ' + error.message);
+                // reset cache
+                this._pwnedPwdsCache[passwordHash] = undefined;
             });
         }
     };
@@ -575,76 +598,72 @@ class HIBP {
                 });
         }
     };
-    filterEntries(app, entries) {
-        // hLogger.debug('getEntriesByFilter: entries = ' + JSON.stringify(entries));
+    checkEntries(app, entries) {
+        this.appModel = app;
+
+        hLogger.debug('getEntriesByFilter: entries = ' + JSON.stringify(entries));
         if (this.checkPwnedList && entries && entries.length) {
-            // get all different names and pwds to reduce the number of calls to the HIBP API
-            const names = [];
-            const pwds = [];
+            // push all different names and pwds to the waiting lists to reduce the number of calls to the HIBP API.
+            // the waiting elements will be processed by checkNextWaitingElement
             entries.forEach(item => {
                 // hLogger.debug('getEntriesByFilter: item = ' + item.title);
-                // get different user names and pwds to optimize queries
                 const name = item.user;
                 if (this.elligibleName(name)) {
-                    const fname = names.find(elem => elem.name === name);
+                    const fname = this.waitingNames.find(elem => elem.name === name);
                     // hLogger.debug("fname=" + JSON.stringify(fname));
                     if (fname) fname.items.push(item);
-                    else names.push({ name: name, items: [item] });
+                    else this.waitingNames.push({ name: name, items: [item] });
                 }
                 let pwd = item.password;
                 if (pwd) {
                     pwd = pwd.getText();
                     if (this.elligiblePwd(pwd)) {
-                        const fpwd = pwds.find(elem => elem.pwd === pwd);
+                        const fpwd = this.waitingPwds.find(elem => elem.pwd === pwd);
                         if (fpwd) fpwd.items.push(item);
-                        else pwds.push({ pwd: pwd, items: [item] });
+                        else this.waitingPwds.push({ pwd: pwd, items: [item] });
                     }
                 }
             });
-
-            // asynchronously look for pawned names and pwds
-            // do somme throttling on names as HIBP does not allow more than one call every 1500 millisecs
-            let throttle = 2000; // millisecs betwwen 2 calls
-            names.forEach((elem, index) => {
-                // hLogger.debug('getEntriesByFilter: check item ' + item.title);
-                setTimeout(() => {
-                    this.checkNamePwned(elem.name)
-                        .then(breaches => {
-                            let refresh = false;
-                            elem.items.forEach(item => {
-                                const itemPwned = item.namePwned;
-                                item.namePwned = breaches;
-                                refresh = refresh || (!breaches !== !itemPwned); // XOR
-                            });
-                            refresh && app.refresh();
-                        })
-                        .catch(err => {
-                            hLogger.error('error in checking name ' + elem.name + 'in get entries by filter: ' + err);
-                        });
-                }, index * throttle);
-            });
-            // no need of throttling for passwords on HIBP, use a low throttle value
-            throttle = 100; // millisecs
-            pwds.forEach((elem, index) => {
-                setTimeout(() => {
-                    this.sha1(elem.pwd)
-                        .then(hpwd => {
-                            return this.checkPwdPwned(hpwd);
-                        })
-                        .then(nb => {
-                            let refresh = false;
-                            elem.items.forEach(item => {
-                                const itemPwned = item.pwdPwned;
-                                item.pwdPwned = nb;
-                                refresh = refresh || (!nb !== !itemPwned); // XOR
-                            });
-                            refresh && app.refresh();
-                        })
-                        .catch(err => {
-                            hLogger.error('error in checking pwd ' + elem.pwd + ' in get entries by filter: ' + err);
-                        });
-                }, index * throttle);
-            });
+        }
+    }
+    /**
+     * gets the first waiting elements (name and pwd) and start checking it
+     */
+    checkNextWaitingElems() {
+        if (this.waitingNames.length) {
+            const elem = this.waitingNames.shift();
+            this.checkNamePwned(elem.name)
+                .then(breaches => {
+                    let refresh = false;
+                    elem.items.forEach(item => {
+                        const itemPwned = item.namePwned;
+                        item.namePwned = breaches;
+                        refresh = refresh || (!breaches !== !itemPwned); // XOR
+                    });
+                    refresh && app.refresh();
+                })
+                .catch(err => {
+                    hLogger.error('error in checking name ' + elem.name + ' in checkNextWaitingElems: ' + err);
+                });
+        }
+        if (this.waitingPwds.length) {
+            const elem = pwds.shift();
+            this.sha1(elem.pwd)
+                .then(hpwd => {
+                    return this.checkPwdPwned(hpwd);
+                })
+                .then(nb => {
+                    let refresh = false;
+                    elem.items.forEach(item => {
+                        const itemPwned = item.pwdPwned;
+                        item.pwdPwned = nb;
+                        refresh = refresh || (!nb !== !itemPwned); // XOR
+                    });
+                    refresh && app.refresh();
+                })
+                .catch(err => {
+                    hLogger.error('error in checking pwd ' + elem.pwd + ' in checkNextWaitingElems: ' + err);
+                });
         }
     }
 };
@@ -703,7 +722,7 @@ ListView.prototype.render = function () {
  */
 AppModel.prototype.getEntriesByFilter = function (filter) {
     const entries = appModelGetEntriesByFilter.apply(this, arguments);
-    hibp.filterEntries(this, entries);
+    hibp.checkEntries(this, entries);
     return entries;
 };
 
@@ -734,8 +753,12 @@ module.exports.getSettings = function () {
             label: HIBPLocale.hibpCheckOnList,
             type: 'checkbox',
             value: hibp.checkPwnedList
+        }, {
+            name: 'debugMode',
+            label: 'debug mode',
+            type: 'checkbox',
+            value: false
         }
-
     ];
 };
 
@@ -746,7 +769,11 @@ module.exports.getSettings = function () {
 module.exports.setSettings = function (changes) {
     for (const field in changes) {
         const ccfield = field.substr(0, 1).toLowerCase() + field.substring(1);
-        hibp[ccfield] = changes[field];
+        if (ccfield === 'debugMode') {
+            hLogger.setLevel(changes[field] ? HLoggerDebug : HLoggerDebug - 1);
+        } else {
+            hibp[ccfield] = changes[field];
+        }
     }
     HIBPUtils.dump(hibp);
 };
