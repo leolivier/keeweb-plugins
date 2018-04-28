@@ -57,7 +57,7 @@ const _ = require('_');
 const Tip = require('util/tip');
 const Alerts = require('comp/alerts');
 const StorageBase = require('storage/storage-base');
-const IoBrowserCache = require('storage/io-browser-cache');
+const IoCache = require('storage/io-cache');
 
 /** Keeps track of 4 replaced methods */
 const detailsViewFieldChanged = DetailsView.prototype.fieldChanged;
@@ -66,7 +66,7 @@ const listViewRender = ListView.prototype.render;
 const appModelGetEntriesByFilter = AppModel.prototype.getEntriesByFilter;
 
 /**
- * Storage cache based on IoBrowserCache.
+ * Storage cache based on IoCache.
  * Inspired from storage-cache.js with a specific config
  * TODO: test this cache in Desktop app
  */
@@ -74,10 +74,10 @@ class StorageCache extends StorageBase {
     constructor() {
         super();
         this.name = 'cache';
-        this.enabled = IoBrowserCache.enabled;
+        this.enabled = IoCache.enabled;
         this.system = true;
         this.init(); // storage base
-        this.io = new IoBrowserCache({
+        this.io = new IoCache({
             cacheName: 'HIBPCache',
             logger: hLogger
         });
@@ -94,33 +94,7 @@ class StorageCache extends StorageBase {
     }
 };
 
-let _seen = [];
 const HIBPUtils = {
-    /**
-     * cyclic objects enabled stringifier
-     * @param {object} obj the object to be stringified
-     * @returns {string} the stringified object
-     */
-    stringify: (obj) => {
-        const ret = JSON.stringify(obj, (key, value) => {
-            if (value != null && typeof value === 'object') {
-                if (_seen.indexOf(value) >= 0) {
-                    return;
-                }
-                _seen.push(value);
-            }
-            return value;
-        });
-        _seen = [];
-        return ret;
-    },
-    /**
-     * writes the stingified object on the console if in debug mode
-     * @param {object} obj the object to be dumped
-     */
-    dump: (obj) => {
-        hLogger.debug(HIBPUtils.stringify(obj));
-    },
     /**
      * Prints a stack trace in debug mode
      */
@@ -130,8 +104,7 @@ const HIBPUtils = {
     },
     /**
      * XML HTTP Request with Promises,
-     * modified from StorageBase
-     * @param {object} config the XML HTTP Request configuration. Same as StorageBase
+     * @param {object} config the XML HTTP Request configuration. Same as in StorageBase
      * @returns {Promise}
      */
     xhrpromise: (config) => {
@@ -149,16 +122,21 @@ const HIBPUtils = {
             };
             xhr.addEventListener('load', () => {
                 if (statuses.indexOf(xhr.status) >= 0) {
-                    resolve(xhr.response);
+                    resolve({ status: xhr.status, data: xhr.response });
                 } else {
-                    hLogger.error(HIBPLocale.hibpApiError, 'GET', xhr.status, xhr.statusText);
+                    hLogger.error(HIBPLocale.hibpApiError, '>GET', xhr.status, xhr.statusText);
                     reject(xhr.statusText);
                 }
             });
             xhr.addEventListener('error', () => {
-                const err = xhr.response && xhr.response.error || new Error('Network error');
-                hLogger.error(HIBPLocale.hibpApiError, 'GET', xhr.status, err);
-                reject(xhr.statusText);
+                // status = 503 means cloudflare started the DDOS protection, must be handled
+                if (xhr.status === 503) {
+                    resolve({ status: 503, data: null });
+                } else {
+                    const err = xhr.response && xhr.response.error || new Error('Network error');
+                    hLogger.error(HIBPLocale.hibpApiError, 'GET>', xhr.status, err);
+                    reject(xhr.statusText);
+                }
             });
             xhr.send(config.data);
         });
@@ -207,28 +185,54 @@ class HIBP {
         this.cache = new StorageCache();
         this.loadCache('_pwnedNamesCache');
         this.loadCache('_pwnedPwdsCache');
-        // starts checking names & pwds asynchronously
-        // do somme throttling on names as HIBP does not allow more than one call every 1500 millisecs
-        const throttle = 2000; // millisecs betwwen 2 calls
-        // names and pwds waiting to be checked
+        // names and pwds waiting to be checked by the scanenr
         this.waitingNames = [];
         this.waitingPwds = [];
+        // the ApplicationModel object
         this.appModel = null;
-        setInterval(() => {
+        // start the scanner
+        this.initScanner();
+        // check if the scan had been stopped and stored in cache in a previous session
+        this.cache.load('stopCheckingNamesUntil', (err, res) => {
+            if (err) {
+                hLogger.info('can\'t load cache stopCheckingNamesUntil: ', err);
+            } else {
+                this.stopCheckingNames = res;
+                if (this.stopCheckingNames && this.stopCheckingNames > Date.now()) this.stopScanner(this.stopCheckingNames - Date.now());
+                else {
+                    this.stopCheckingNames = false;
+                    this.cache.remove('stopCheckingNamesUntil');
+                }
+            }
+        });
+    }
+    /**
+     * starts a scanner for checking names & pwds asynchronously
+     * Do some throttling on names as HIBP does not allow more than one call every 1500 millisecs
+     */
+    initScanner() {
+        this.stopCheckingNames = false;
+        // millisecs betwwen 2 calls
+        const throttle = 1800;
+        this.interval = setInterval(() => {
             this.checkNextWaitingElems();
         }, throttle);
     }
     /**
-     * Show the details of an entry in debug mode
-     * @param {Entry} entry the entry to be shown
+     * Stop the scanner for a given duration
+     * Used when ddos attack detected on CloudFlare, see checkNamePwned method
+     * @param {number} duration
      */
-    showItem(entry) {
-        if (entry) {
-            hLogger.debug('show entry ' + entry.title +
-                ': name=' + entry.user + ', pwd=' + (entry.password ? entry.password.getText() : 'undefined') +
-                ', namePwned=' + entry.namePwned + ', pwdPwned=' + entry.pwdPwned
-            );
-        }
+    stopScanner(duration) {
+        // date when the scan will restart
+        this.stopCheckingNames = Date.now() + duration;
+        clearInterval(this.interval);
+        // store in cache so that we can find it even if the session is interrupted
+        this.cache.save('stopCheckingNamesUntil', this.stopCheckingNames);
+        // restart the scanner after duration
+        setTimeout(() => {
+            this.initScanner();
+        }, duration);
     }
     /**
      * Add css stuff + tip on fields to show an alert on pawned fields
@@ -264,9 +268,7 @@ class HIBP {
      */
     storeCache(cacheVarName) {
         this.cache.save(cacheVarName, this[cacheVarName], (err) => {
-            if (err) {
-                hLogger.error('can\'t store cache ' + cacheVarName + ': ' + err);
-            }
+            hLogger.error('can\'t store cache', cacheVarName, err);
         });
     }
     /**
@@ -277,7 +279,7 @@ class HIBP {
     loadCache(cacheVarName) {
         this.cache.load(cacheVarName, (err, res) => {
             if (err) {
-                hLogger.info('can\'t load cache ' + cacheVarName + ': ' + err);
+                hLogger.info('can\'t load cache', cacheVarName, err);
             } else {
                 // check each element to remove too old ones
                 for (const key in res) {
@@ -286,11 +288,11 @@ class HIBP {
                     if (diff < CacheTTL) {
                         this[cacheVarName][key] = value;
                     } else {
-                        hLogger.info('cache too old for ' + cacheVarName + '.' + key);
+                        hLogger.info('cache too old', cacheVarName, key);
                         this[cacheVarName][key] = undefined;
                     }
-                    // HIBPUtils.dump(this);
                 }
+                // hLogger.debug('loadCache', this);
             }
         });
     }
@@ -325,37 +327,57 @@ class HIBP {
      * @returns {Promise} a promise resolving to an html string containing a list of breaches names if pwned, or null if either being checked or not breached
      */
     checkNamePwned (uname) {
-        hLogger.debug('checking user name ' + uname);
+        hLogger.debug('checking user name', uname);
         const name = encodeURIComponent(uname);
         if (this.checkCache(this._pwnedNamesCache[name])) {
-            hLogger.debug(' user name found in cache: ' + name);
+            hLogger.debug('user name found in cache', name);
             return Promise.resolve(this._pwnedNamesCache[name].val);
         } else {
-            hLogger.debug('USER NAME NOT FOUND in cache: ' + name); // + ' cache=' + this.stringify(this._pwnedNamesCache));
+            if (this.stopCheckingNames) return Promise.resolve(null); // do nothing if flag set
+            hLogger.debug('USER NAME NOT FOUND in cache', name); // , 'cache=', this._pwnedNamesCache);
             // store the name in cache with a null value so that we don't ask multiple times the same name
             this._pwnedNamesCache[name] = { date: Date.now(), val: null };
             const url = `https://haveibeenpwned.com/api/v2/breachedaccount/${name}?truncateResponse=true`;
-            // hLogger.debug('url ' + url);
+            // hLogger.debug('url', url);
             return HIBPUtils.xhrpromise({
                 url: url,
                 method: 'GET',
                 responseType: 'json',
                 headers: null,
                 data: null,
-                statuses: [200, 404]
-            }).then(data => {
-                let breaches = null;
-                if (data && data.length > 0) {
-                    // hLogger.debug('found breaches ' + JSON.stringify(data));
-                    breaches = '';
-                    data.forEach(breach => { breaches += '<li>' + _.escape(breach.Name) + '</li>\n'; });
+                // 503 is an error but treated in xhrpromise as a resolve case
+                statuses: [200, 404, 429]
+            }).then(res => {
+                hLogger.debug('return from name pwned', res);
+                switch (res.status) {
+                    case 200:
+                        let breaches = '';
+                        if (res.data && res.data.length > 0) {
+                            // hLogger.debug('found breaches', data);
+                            res.data.forEach(breach => { breaches += '<li>' + _.escape(breach.Name) + '</li>\n'; });
+                        }
+                        this._pwnedNamesCache[name] = { date: Date.now(), val: breaches };
+                        if (breaches) hLogger.info(`name ${name} pwned in ${breaches}`);
+                        this.storeCache('_pwnedNamesCache');
+                        return breaches;
+                    case 404:
+                        this._pwnedNamesCache[name] = { date: Date.now(), val: null };
+                        this.storeCache('_pwnedNamesCache');
+                        return null;
+                    case 429: // Throttling in HIBP
+                        // put in the waiting list but with no item...
+                        this.waitingNames.push({ name: name, items: [] });
+                        break;
+                    case 503: // Cloudflare DDOS protection
+                        // stop checking names for 24 hours + 1mn
+                        hLogger.warn('We did too many requests on haveIBeenPwned.');
+                        hLogger.warn('Their DDOS attack protection is triggered,');
+                        hLogger.warn('Stopping requests for 24 hours...');
+                        const h24 = (24 * 60 + 1) * 60 * 1000;
+                        this.stopScanner(h24);
                 }
-                this._pwnedNamesCache[name] = { date: Date.now(), val: breaches };
-                if (breaches) hLogger.info(`name ${name} pwned in ${breaches}`);
-                this.storeCache('_pwnedNamesCache');
-                return breaches;
             }).catch(error => {
-                hLogger.error('check pwned name error: ' + error.message);
+                hLogger.error('check pwned name error', error.message);
                 // reset cache to unknown
                 this._pwnedNamesCache[name] = undefined;
             });
@@ -369,14 +391,14 @@ class HIBP {
      */
     checkPwdPwned (passwordHash) {
         passwordHash = passwordHash.toUpperCase();
-        hLogger.debug('checking pwd (hashed) ' + passwordHash);
+        hLogger.debug('checking pwd (hashed)', passwordHash);
         const prefix = passwordHash.substring(0, 5);
         if (this.checkCache(this._pwnedPwdsCache[passwordHash])) {
             const val = this._pwnedPwdsCache[passwordHash].val ? this._pwnedPwdsCache[passwordHash].val : null;
-            hLogger.debug('found pwd in cache: ' + passwordHash + ' val:' + val);
+            hLogger.debug('found pwd in cache', passwordHash, val);
             return Promise.resolve(val);
         } else {
-            hLogger.debug('PWD NOT FOUND in cache: ' + passwordHash); // + ' cache=' + this.stringify(this._pwnedPwdsCache));
+            hLogger.debug('PWD NOT FOUND in cache', passwordHash); // , ' cache=', this._pwnedPwdsCache);
             // store the pwd in cache with a null value so that we don't ask multiple times the same pwd
             this._pwnedPwdsCache[passwordHash] = { date: Date.now(), val: null };
             return HIBPUtils.xhrpromise({
@@ -386,26 +408,25 @@ class HIBP {
                 headers: null,
                 data: null,
                 statuses: [200, 404]
-            }).then(data => {
+            }).then(res => {
                 let nb = null;
-                if (data) {
-                    // hLogger.debug('found breaches ' + JSON.stringify(data));
-                    data.split('\r\n').some(line => {
+                if (res.status === 200) {
+                    // hLogger.debug('found breaches', data);
+                    res.data.split('\r\n').some(line => {
                         const h = line.split(':');
                         const suffix = h[0];
                         if (prefix + suffix === passwordHash) {
                             nb = _.escape(h[1]);
-                            // hLogger.debug('matching breach ' + suffix);
+                            hLogger.info(`password ${passwordHash} pawned ${nb} times`);
                             return true;
                         }
                     });
                 }
                 this._pwnedPwdsCache[passwordHash] = { date: Date.now(), val: nb };
-                if (nb) hLogger.info(`password ${passwordHash} pawned ${nb} times`);
                 this.storeCache('_pwnedPwdsCache');
                 return nb;
             }).catch(error => {
-                hLogger.error('check pwned password error: ' + error.message);
+                hLogger.error('check pwned password error', error.message);
                 // reset cache
                 this._pwnedPwdsCache[passwordHash] = undefined;
             });
@@ -484,7 +505,7 @@ class HIBP {
     handlePasswordChange(dview, pwd, args) {
         pwd = pwd ? pwd.getText() : null;
         if (hibp.elligiblePwd(pwd)) {
-            // hLogger.debug('pwd:>>>' + pwd + '<<<');
+            // hLogger.debug('pwd:>>>', pwd, '<<<');
             this.sha1(pwd)
                 .then(hpwd => {
                     return this.checkPwdPwned(hpwd);
@@ -512,7 +533,7 @@ class HIBP {
                         this.alertPwdPwned(dview, null, null, args);
                     }
                 }).catch(error => {
-                    hLogger.error('check pwned password error: ' + error.message);
+                    hLogger.error('check pwned password error', error.message);
                 });
         } else {
             this.alertPwdPwned(dview, null, null, args);
@@ -551,7 +572,7 @@ class HIBP {
                         this.alertNamePwned(dview, null, null, args);
                     }
                 }).catch(error => {
-                    hLogger.error('check pwned name error: ' + error.message);
+                    hLogger.error('check pwned name error', error.message);
                 });
         } else {
             hibp.alertNamePwned(this, null, null, args);
@@ -560,14 +581,14 @@ class HIBP {
     displayFields(dview) {
         // check password
         const pwd = dview.model.password ? dview.model.password.getText() : null;
-        // hLogger.debug('addfv pwd:>>>' + pwd + '<<<');
+        // hLogger.debug('addfv pwd:>>>', pwd, '<<<');
         if (this.checkPwnedPwd !== HIBPCheckLevel.None && this.elligiblePwd(pwd)) {
             this.sha1(pwd)
                 .then(hpwd => {
                     return this.checkPwdPwned(hpwd);
                 })
                 .then(nb => {
-                    // hLogger.debug(pwd + ' pppwand: ' + nb);
+                    // hLogger.debug(pwd, 'pppwand', nb);
                     dview.model.pwdPwned = nb;
                     if (nb) { // pawned
                         const warning = HIBPLocale.hibpPwdWarning.replace('{}', nb);
@@ -576,12 +597,12 @@ class HIBP {
                         this.passed(dview.passEditView.$el, 'check pwned password passed...');
                     }
                 }).catch(error => {
-                    hLogger.error('check pwned pwd error: ' + error);
+                    hLogger.error('check pwned pwd error', error);
                 });
         }
         // check user name
         let name = dview.userEditView.value;
-        // hLogger.debug('addfv name:>>>' + name + '<<<');
+        // hLogger.debug('addfv name:>>>', name, '<<<');
         if (this.elligibleName(name) && this.checkPwnedName !== HIBPCheckLevel.None) {
             this.checkNamePwned(name)
                 .then(breaches => {
@@ -594,23 +615,23 @@ class HIBP {
                         this.passed(dview.userEditView.$el, 'check pwned user name passed...');
                     }
                 }).catch(error => {
-                    hLogger.error('check pwned name error: ' + HIBPUtils.stringify(error));
+                    hLogger.error('check pwned name error', error);
                 });
         }
     };
     checkEntries(app, entries) {
         this.appModel = app;
 
-        hLogger.debug('getEntriesByFilter: entries = ' + JSON.stringify(entries));
-        if (this.checkPwnedList && entries && entries.length) {
-            // push all different names and pwds to the waiting lists to reduce the number of calls to the HIBP API.
+        hLogger.debug('getEntriesByFilter', 'entries =', entries);
+        if (this.checkPwnedList && !this.stopCheckingNames && entries && entries.length) {
+            // push all different names and pwds not already in cache to the waiting lists to reduce the number of calls to the HIBP API.
             // the waiting elements will be processed by checkNextWaitingElement
             entries.forEach(item => {
-                // hLogger.debug('getEntriesByFilter: item = ' + item.title);
-                const name = item.user;
-                if (this.elligibleName(name)) {
+                // hLogger.debug('getEntriesByFilter', 'item=', item.title);
+                const name = encodeURIComponent(item.user);
+                if (this.elligibleName(item.user) && !this.checkCache(this._pwnedNamesCache[name])) {
                     const fname = this.waitingNames.find(elem => elem.name === name);
-                    // hLogger.debug("fname=" + JSON.stringify(fname));
+                    // hLogger.debug('fname=', fname);
                     if (fname) fname.items.push(item);
                     else this.waitingNames.push({ name: name, items: [item] });
                 }
@@ -618,11 +639,17 @@ class HIBP {
                 if (pwd) {
                     pwd = pwd.getText();
                     if (this.elligiblePwd(pwd)) {
-                        const fpwd = this.waitingPwds.find(elem => elem.pwd === pwd);
-                        if (fpwd) fpwd.items.push(item);
-                        else this.waitingPwds.push({ pwd: pwd, items: [item] });
+                        this.sha1(pwd)
+                            .then(passwordHash => {
+                                passwordHash.toUpperCase();
+                                if (!this.checkCache(this._pwnedPwdsCache[passwordHash])) {
+                                    const fpwd = this.waitingPwds.find(elem => elem.pwd === pwd);
+                                    if (fpwd) fpwd.items.push(item);
+                                    else this.waitingPwds.push({ pwd: pwd, items: [item] });
+                                }
+                            });
                     }
-                }
+                };
             });
         }
     }
@@ -643,7 +670,7 @@ class HIBP {
                     refresh && this.appModel.refresh();
                 })
                 .catch(err => {
-                    hLogger.error('error in checking name ' + elem.name + ' in checkNextWaitingElems: ' + err);
+                    hLogger.error('error in checking name', elem.name, 'in checkNextWaitingElems', err);
                 });
         }
         if (this.waitingPwds.length) {
@@ -662,7 +689,7 @@ class HIBP {
                     refresh && this.appModel.refresh();
                 })
                 .catch(err => {
-                    hLogger.error('error in checking pwd ' + elem.pwd + ' in checkNextWaitingElems: ' + err);
+                    hLogger.error('error in checking pwd', elem.pwd, 'in checkNextWaitingElems', err);
                 });
         }
     }
@@ -679,7 +706,7 @@ const hibp = new HIBP();
  */
 DetailsView.prototype.fieldChanged = function (e) {
     if (e.field) {
-        // hLogger.debug('field changed ' + hibp.stringify(e));
+        // hLogger.debug('field changed', e);
         // first check password
         if (e.field === '$Password' && hibp.checkPwnedPwd !== HIBPCheckLevel.None && this.passEditView.value) {
             hibp.handlePasswordChange(this, e.val, arguments);
@@ -775,7 +802,7 @@ module.exports.setSettings = function (changes) {
             hibp[ccfield] = changes[field];
         }
     }
-    HIBPUtils.dump(hibp);
+    hLogger.debug('SetSettings', hibp);
 };
 
 /**
