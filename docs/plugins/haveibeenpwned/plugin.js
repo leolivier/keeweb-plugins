@@ -10,9 +10,10 @@ const Logger = require('util/logger');
  * @type {Logger}
  */
 const hLogger = new Logger('HaveIBeenPwned');
-/** change log level here. Should be changed to Info when issue #893 fixed on keeweb */
+/** change log level here. Should be changed to Debug/Warn when issue #893 fixed on keeweb */
 const HLoggerDebug = Logger.Level.All;
-hLogger.setLevel(HLoggerDebug - 1);
+const HLoggerRegular = Logger.Level.Info;
+hLogger.setLevel(HLoggerRegular);
 
 /**
  * Cache time to live
@@ -30,7 +31,7 @@ const HIBPLocale = {
     hibpCheckLevelAskMe: 'Yes and ask me if pwned',
     hibpCheckOnList: 'Show pawned entries on list',
     hibpPwdWarning: `WARNING! This password was used by {} pawned accounts referenced on <a href='https://haveibeenpwned.com'>https://haveibeenpwned.com</a>!`,
-    hibpNameWarning: 'WARNING! The account named "{name}" has been pawned in the following breaches<br/>\n<ul>\n{breaches}\n</ul><p>Please check on <a href=\'https://haveibeenpwned.com\'>https://haveibeenpwned.com</a></p>',
+    hibpNameWarning: 'WARNING! The account named "{name}" has been pawned in the following breaches<br/><ul>{breaches}</ul><p>Please check on <a href=\'https://haveibeenpwned.com\'>https://haveibeenpwned.com</a></p>',
     hibpChangePwd: 'Do you want to keep this new password?',
     hibpChangeName: 'Do you want to keep this new user name?',
     hibpApiError: 'HaveIBeenPwned API error'
@@ -58,6 +59,7 @@ const Tip = require('util/tip');
 const Alerts = require('comp/alerts');
 const StorageBase = require('storage/storage-base');
 const IoCache = require('storage/io-cache');
+const Launcher = require('comp/launcher');
 
 /** Keeps track of 4 replaced methods */
 const detailsViewFieldChanged = DetailsView.prototype.fieldChanged;
@@ -84,10 +86,19 @@ class StorageCache extends StorageBase {
     };
 
     save(id, data, callback) {
+        if (Launcher) data = Kdbxweb.ByteUtils.stringToBytes(JSON.stringify(data));
         this.io.save(id, data, callback);
     };
     load(id, callback) {
-        this.io.load(id, callback);
+        this.io.load(id, Launcher ? (err, res) => {
+            if (err) callback(err);
+            else {
+                const str = Kdbxweb.ByteUtils.bytesToString(res);
+                // hLogger.debug('cache.load', str);
+                const data = JSON.parse(str);
+                callback(err, data);
+            }
+        } : callback);
     };
     remove(id, callback) {
         this.io.remove(id, callback);
@@ -95,6 +106,13 @@ class StorageCache extends StorageBase {
 };
 
 const HIBPUtils = {
+    /**
+     * xor between two objects
+     */
+    xor: (any1, any2) => {
+        // !any1 ==> boolean, same for !any2, xor = true if they're different
+        return (!any1 !== !any2);
+    },
     /**
      * Prints a stack trace in debug mode
      */
@@ -104,7 +122,7 @@ const HIBPUtils = {
     },
     /**
      * XML HTTP Request with Promises,
-     * @param {object} config the XML HTTP Request configuration. Same as in StorageBase
+     * @param {object} config the XML HTTP Request configuration. Same as in StorageBase.
      * @returns {Promise}
      */
     xhrpromise: (config) => {
@@ -179,29 +197,29 @@ class HIBP {
         this.checkPwnedName = HIBPCheckLevel.Alert;
         this.checkPwnedList = false;
         // cache variables
-        this._pwnedNamesCache = {};
-        this._pwnedPwdsCache = {};
+        this._pwnedNamesCache = new Map();
+        this._pwnedPwdsCache = new Map();
         // cache manager
-        this.cache = new StorageCache();
-        this.loadCache('_pwnedNamesCache');
-        this.loadCache('_pwnedPwdsCache');
+        this._storage = new StorageCache();
+        this._loadCache('_pwnedNamesCache');
+        this._loadCache('_pwnedPwdsCache');
         // names and pwds waiting to be checked by the scanenr
-        this.waitingNames = [];
-        this.waitingPwds = [];
+        this._waitingNames = [];
+        this._waitingPwds = [];
         // the ApplicationModel object
-        this.appModel = null;
+        this._appModel = null;
         // start the scanner
-        this.initScanner();
+        this._initScanner();
         // check if the scan had been stopped and stored in cache in a previous session
-        this.cache.load('stopCheckingNamesUntil', (err, res) => {
+        this._storage.load('stopCheckingNamesUntil', (err, res) => {
             if (err) {
                 hLogger.info('can\'t load cache stopCheckingNamesUntil: ', err);
             } else {
                 this.stopCheckingNames = res;
-                if (this.stopCheckingNames && this.stopCheckingNames > Date.now()) this.stopScanner(this.stopCheckingNames - Date.now());
+                if (this.stopCheckingNames && this.stopCheckingNames > Date.now()) this._stopScanner(this.stopCheckingNames - Date.now());
                 else {
                     this.stopCheckingNames = false;
-                    this.cache.remove('stopCheckingNamesUntil');
+                    this._storage.remove('stopCheckingNamesUntil');
                 }
             }
         });
@@ -210,10 +228,10 @@ class HIBP {
      * starts a scanner for checking names & pwds asynchronously
      * Do some throttling on names as HIBP does not allow more than one call every 1500 millisecs
      */
-    initScanner() {
+    _initScanner() {
         this.stopCheckingNames = false;
         // millisecs betwwen 2 calls
-        const throttle = 1800;
+        const throttle = 2000;
         this.interval = setInterval(() => {
             this.checkNextWaitingElems();
         }, throttle);
@@ -223,15 +241,15 @@ class HIBP {
      * Used when ddos attack detected on CloudFlare, see checkNamePwned method
      * @param {number} duration
      */
-    stopScanner(duration) {
+    _stopScanner(duration) {
         // date when the scan will restart
         this.stopCheckingNames = Date.now() + duration;
         clearInterval(this.interval);
         // store in cache so that we can find it even if the session is interrupted
-        this.cache.save('stopCheckingNamesUntil', this.stopCheckingNames);
+        this._storage.save('stopCheckingNamesUntil', this.stopCheckingNames);
         // restart the scanner after duration
         setTimeout(() => {
-            this.initScanner();
+            this._initScanner();
         }, duration);
     }
     /**
@@ -239,7 +257,7 @@ class HIBP {
      * @param {Element} el the HTML element of the field
      * @param {string} msg the message to print in the tip
      */
-    alert(el, msg) {
+    _alert(el, msg) {
         hLogger.info(msg);
         el.focus();
         el.addClass('input--error');
@@ -252,7 +270,7 @@ class HIBP {
      * @param {Element} el the HTML element of the field
      * @param {string} msg the message to print in the console
      */
-    passed(el, msg) {
+    _passed(el, msg) {
         hLogger.info(msg);
         el.removeClass('input--error');
         el.find('.details__field-value').removeClass('hibp-pwned');
@@ -266,9 +284,14 @@ class HIBP {
      * Store the desired cache in local storage
      * @param {string} cacheVarName the name of the cache variable ('_pwnedNamesCache' or '_pwnedPwdsCache')
      */
-    storeCache(cacheVarName) {
-        this.cache.save(cacheVarName, this[cacheVarName], (err) => {
-            hLogger.error('can\'t store cache', cacheVarName, err);
+    _storeCache(cacheVarName) {
+        const cache = [];
+        this[cacheVarName].forEach((value, key) => {
+            cache.push({ key: key, value: value });
+        });
+        // hLogger.debug('storing cache', cacheVarName, cache);
+        this._storage.save(cacheVarName, cache, (err) => {
+            err && hLogger.error('can\'t store cache', cacheVarName, cache, err);
         });
     }
     /**
@@ -276,33 +299,54 @@ class HIBP {
      * Values older than CacheTTL are discarded
      * @param {string} cacheVarName the name of the cache variable ('_pwnedNamesCache' or '_pwnedPwdsCache')
      */
-    loadCache(cacheVarName) {
-        this.cache.load(cacheVarName, (err, res) => {
+    _loadCache(cacheVarName) {
+        this._storage.load(cacheVarName, (err, res) => {
             if (err) {
-                hLogger.info('can\'t load cache', cacheVarName, err);
+                hLogger.warn('can\'t load cache', cacheVarName, err);
             } else {
+                // hLogger.debug('load cache', res);
                 // check each element to remove too old ones
-                for (const key in res) {
-                    const value = res[key];
-                    const diff = Date.now() - value.date; // cache age in millisec
+                Array.isArray(res) && res.forEach(entry => {
+                    const diff = Date.now() - entry.value.date; // cache age in millisec
                     if (diff < CacheTTL) {
-                        this[cacheVarName][key] = value;
+                        this[cacheVarName].set(entry.key, entry.value);
                     } else {
-                        hLogger.info('cache too old', cacheVarName, key);
-                        this[cacheVarName][key] = undefined;
+                        hLogger.info('cache too old', cacheVarName, entry.key);
+                        this[cacheVarName].delete(entry.key); // You never know...
                     }
-                }
-                // hLogger.debug('loadCache', this);
+                });
+                // hLogger.debug('_loadCache', this[cacheVarName]);
             }
         });
     }
     /**
      * true if cached element exist and is not too old
      * @param {string} cachedElem the cache element to check
-     * @returns {boolean}
+     * @returns {boolean} true if the elem is in the cache and is not too old, else false
      */
-    checkCache(cachedElem) {
-        return (cachedElem && (Date.now() - cachedElem.date) < CacheTTL);
+    _isInCache(cacheName, elemId) {
+        const cachedElem = this[cacheName].get(elemId);
+        if (cachedElem) {
+            if ((Date.now() - cachedElem.date) < CacheTTL) return true;
+            else {
+                this[cachedElem].remove(elemId);
+                return false;
+            }
+        } else return false;
+    }
+    /**
+     * get a name or a password breach from the cache
+     * @param {string} cacheName the name of the cache variable ('_pwnedNamesCache' or '_pwnedPwdsCache')
+     * @param {string} elemId the name or the pwd to find from the cache
+     * @returns {string or number} the value from the cache (the value can be null, you *must* call _isInCache before calling _getCache)
+     */
+    _getCache(cacheName, elemId) {
+        const cachedElem = this[cacheName].get(elemId);
+        if (!cachedElem) throw new Error(`elem {elemId} not found in cache {cacheName}`);
+        return cachedElem.val;
+    }
+    _setCache(cacheName, elemId, val) {
+        this[cacheName].set(elemId, { date: Date.now(), val: val });
     }
     /**
      * Computes and returns the SHA1 hash of a string
@@ -329,14 +373,14 @@ class HIBP {
     checkNamePwned (uname) {
         hLogger.debug('checking user name', uname);
         const name = encodeURIComponent(uname);
-        if (this.checkCache(this._pwnedNamesCache[name])) {
+        if (this._isInCache('_pwnedNamesCache', name)) {
             hLogger.debug('user name found in cache', name);
-            return Promise.resolve(this._pwnedNamesCache[name].val);
+            return Promise.resolve(this._getCache('_pwnedNamesCache', name));
         } else {
             if (this.stopCheckingNames) return Promise.resolve(null); // do nothing if flag set
             hLogger.debug('USER NAME NOT FOUND in cache', name); // , 'cache=', this._pwnedNamesCache);
             // store the name in cache with a null value so that we don't ask multiple times the same name
-            this._pwnedNamesCache[name] = { date: Date.now(), val: null };
+            this._setCache('_pwnedNamesCache', name, null);
             const url = `https://haveibeenpwned.com/api/v2/breachedaccount/${name}?truncateResponse=true`;
             // hLogger.debug('url', url);
             return HIBPUtils.xhrpromise({
@@ -354,32 +398,33 @@ class HIBP {
                         let breaches = '';
                         if (res.data && res.data.length > 0) {
                             // hLogger.debug('found breaches', data);
-                            res.data.forEach(breach => { breaches += '<li>' + _.escape(breach.Name) + '</li>\n'; });
+                            res.data.forEach(breach => { breaches += '<li>' + _.escape(breach.Name) + '</li>'; });
                         }
-                        this._pwnedNamesCache[name] = { date: Date.now(), val: breaches };
+                        this._setCache('_pwnedNamesCache', name, breaches);
                         if (breaches) hLogger.info(`name ${name} pwned in ${breaches}`);
-                        this.storeCache('_pwnedNamesCache');
+                        this._storeCache('_pwnedNamesCache');
                         return breaches;
                     case 404:
-                        this._pwnedNamesCache[name] = { date: Date.now(), val: null };
-                        this.storeCache('_pwnedNamesCache');
+                        this._setCache('_pwnedNamesCache', name, null);
+                        this._storeCache('_pwnedNamesCache');
                         return null;
                     case 429: // Throttling in HIBP
-                        // put in the waiting list but with no item...
-                        this.waitingNames.push({ name: name, items: [] });
+                        hLogger.warn('Warning, too many request on HIBP!');
+                        // put back in the waiting list but with no item: at least, it'll be in the cache next time...
+                        this._waitingNames.unshift({ name: name, items: [] });
                         break;
                     case 503: // Cloudflare DDOS protection
                         // stop checking names for 24 hours + 1mn
                         hLogger.warn('We did too many requests on haveIBeenPwned.');
-                        hLogger.warn('Their DDOS attack protection is triggered,');
+                        hLogger.debug('Cloudflare DDOS attack protection is triggered,');
                         hLogger.warn('Stopping requests for 24 hours...');
                         const h24 = (24 * 60 + 1) * 60 * 1000;
-                        this.stopScanner(h24);
+                        this._stopScanner(h24);
                 }
             }).catch(error => {
-                hLogger.error('check pwned name error', error.message);
+                hLogger.error('checkNamePwned: check pwned name error', error.message);
                 // reset cache to unknown
-                this._pwnedNamesCache[name] = undefined;
+                this._pwnedNamesCache.delete(name);
             });
         }
     };
@@ -393,14 +438,14 @@ class HIBP {
         passwordHash = passwordHash.toUpperCase();
         hLogger.debug('checking pwd (hashed)', passwordHash);
         const prefix = passwordHash.substring(0, 5);
-        if (this.checkCache(this._pwnedPwdsCache[passwordHash])) {
-            const val = this._pwnedPwdsCache[passwordHash].val ? this._pwnedPwdsCache[passwordHash].val : null;
+        if (this._isInCache('_pwnedPwdsCache', passwordHash)) {
+            const val = this._getCache('_pwnedPwdsCache', passwordHash);
             hLogger.debug('found pwd in cache', passwordHash, val);
             return Promise.resolve(val);
         } else {
-            hLogger.debug('PWD NOT FOUND in cache', passwordHash); // , ' cache=', this._pwnedPwdsCache);
+            hLogger.debug('PWD NOT FOUND in cache', passwordHash);
             // store the pwd in cache with a null value so that we don't ask multiple times the same pwd
-            this._pwnedPwdsCache[passwordHash] = { date: Date.now(), val: null };
+            this._setCache('_pwnedPwdsCache', passwordHash, null);
             return HIBPUtils.xhrpromise({
                 url: `https://api.pwnedpasswords.com/range/${prefix}`,
                 method: 'GET',
@@ -422,13 +467,13 @@ class HIBP {
                         }
                     });
                 }
-                this._pwnedPwdsCache[passwordHash] = { date: Date.now(), val: nb };
-                this.storeCache('_pwnedPwdsCache');
+                this._setCache('_pwnedPwdsCache', passwordHash, nb);
+                this._storeCache('_pwnedPwdsCache');
                 return nb;
             }).catch(error => {
                 hLogger.error('check pwned password error', error.message);
                 // reset cache
-                this._pwnedPwdsCache[passwordHash] = undefined;
+                this._pwnedPwdsCache.delete(passwordHash);
             });
         }
     };
@@ -447,17 +492,17 @@ class HIBP {
      * @param {string} warning the warning to display
      * @param {...} args the arguments to be passed to the original 'fieldChanged' function
      */
-    alertPwdPwned (dview, npwned, warning, args) {
+    _alertPwdPwned (dview, npwned, warning, args) {
         if (npwned) { // pwned
             // record pawnage in the model to be able to show it in list view
             dview.model.pwdPwned = npwned;
             // calls original function
             detailsViewFieldChanged.apply(dview, args);
             // sets the alert
-            this.alert(dview.passEditView.$el, warning);
+            this._alert(dview.passEditView.$el, warning);
         } else { // not pwned
             // reset css and tip
-            this.passed(dview.passEditView.$el, 'check pwned password passed...');
+            this._passed(dview.passEditView.$el, 'check pwned password passed...');
             // reset pawnage in the model
             dview.model.pwdPwned = null;
             // call initial function
@@ -473,23 +518,23 @@ class HIBP {
         return (name && name.replace(/\s/, '') !== '');
     }
     /**
-     * Change the name field to display an alert or reset it depending on breaches value
+     * Change the name field to display an _alert or reset it depending on breaches value
      * @param {View} dview the details view
      * @param {string} breaches the breaches in which the name has been pawned (or null or '' if none)
      * @param {string} warning the warning to display
-     * @param {...} args the arguments to be passed to the original 'fieldChanged' function
+     * @param {...} args the arguments to be _passed to the original 'fieldChanged' function
      */
-    alertNamePwned (dview, breaches, warning, args) {
+    _alertNamePwned (dview, breaches, warning, args) {
         if (breaches) { // pwned
             // remember breaches in the model to be able to show it in list view
             dview.model.namePwned = breaches;
             // call initial function
             detailsViewFieldChanged.apply(dview, args);
             // adds an alert
-            this.alert(dview.userEditView.$el, warning);
+            this._alert(dview.userEditView.$el, warning);
         } else { // not pwned
             // reset alert
-            this.passed(dview.userEditView.$el, 'check pwned user name passed...');
+            this._passed(dview.userEditView.$el, 'check pwned user name _passed...');
             // reset the model
             dview.model.namePwned = null;
             // call initial function
@@ -520,23 +565,23 @@ class HIBP {
                                 body: warning,
                                 icon: 'exclamation-triangle',
                                 success: () => { // keep password, just set an alert
-                                    this.alertPwdPwned(dview, npwned, warning, args);
+                                    this._alertPwdPwned(dview, npwned, warning, args);
                                 },
                                 cancel: () => { // reset password by not registering change
                                     hLogger.info('keeping old passwd');
                                 }
                             });
                         } else { // check level = alert, keep pwd, set an alert
-                            this.alertPwdPwned(dview, npwned, warning, args);
+                            this._alertPwdPwned(dview, npwned, warning, args);
                         }
                     } else { // not pawned
-                        this.alertPwdPwned(dview, null, null, args);
+                        this._alertPwdPwned(dview, null, null, args);
                     }
                 }).catch(error => {
                     hLogger.error('check pwned password error', error.message);
                 });
         } else {
-            this.alertPwdPwned(dview, null, null, args);
+            this._alertPwdPwned(dview, null, null, args);
         }
     }
     /**
@@ -559,25 +604,30 @@ class HIBP {
                                 body: warning,
                                 icon: 'exclamation-triangle',
                                 success: () => { // keep name, but set an alert
-                                    this.alertNamePwned(dview, breaches, warning, args);
+                                    this._alertNamePwned(dview, breaches, warning, args);
                                 },
                                 cancel: () => { // reset name by not registering change
                                     hLogger.info('reverting to previous user name');
                                 }
                             });
                         } else { // check level = alert, keep new name but sets an alert
-                            this.alertNamePwned(dview, breaches, warning, args);
+                            this._alertNamePwned(dview, breaches, warning, args);
                         }
                     } else { // not pawned
-                        this.alertNamePwned(dview, null, null, args);
+                        this._alertNamePwned(dview, null, null, args);
                     }
                 }).catch(error => {
                     hLogger.error('check pwned name error', error.message);
                 });
         } else {
-            hibp.alertNamePwned(this, null, null, args);
+            hibp._alertNamePwned(this, null, null, args);
         }
     }
+    /**
+     * Displays name and password fieds in the details view depending on thair pawnage status.
+     * The status is checked dynamically.
+     * @param {DetailsView} dview the detailed view
+     */
     displayFields(dview) {
         // check password
         const pwd = dview.model.password ? dview.model.password.getText() : null;
@@ -592,9 +642,9 @@ class HIBP {
                     dview.model.pwdPwned = nb;
                     if (nb) { // pawned
                         const warning = HIBPLocale.hibpPwdWarning.replace('{}', nb);
-                        this.alert(dview.passEditView.$el, warning);
+                        this._alert(dview.passEditView.$el, warning);
                     } else { // not pawned
-                        this.passed(dview.passEditView.$el, 'check pwned password passed...');
+                        this._passed(dview.passEditView.$el, 'check pwned password passed...');
                     }
                 }).catch(error => {
                     hLogger.error('check pwned pwd error', error);
@@ -610,30 +660,41 @@ class HIBP {
                     if (breaches) { // pawned
                         name = _.escape(name); // breaches already escaped
                         const warning = HIBPLocale.hibpNameWarning.replace('{name}', name).replace('{breaches}', breaches);
-                        this.alert(dview.userEditView.$el, warning);
+                        this._alert(dview.userEditView.$el, warning);
                     } else { // not pawned
-                        this.passed(dview.userEditView.$el, 'check pwned user name passed...');
+                        this._passed(dview.userEditView.$el, 'check pwned user name passed...');
                     }
                 }).catch(error => {
-                    hLogger.error('check pwned name error', error);
+                    hLogger.error('displayFields: check pwned name error', error);
                 });
         }
     };
+    /**
+     * Check asynchronously the given entries from the given application model
+     * @param {AppModel} app the Application Model
+     * @param {Model} entries the entries to check
+     */
     checkEntries(app, entries) {
-        this.appModel = app;
+        this._appModel = app;
 
-        hLogger.debug('getEntriesByFilter', 'entries =', entries);
+        hLogger.debug('getEntriesByFilter'); // , 'entries =', entries);
         if (this.checkPwnedList && !this.stopCheckingNames && entries && entries.length) {
+            let refresh = false;
             // push all different names and pwds not already in cache to the waiting lists to reduce the number of calls to the HIBP API.
             // the waiting elements will be processed by checkNextWaitingElement
             entries.forEach(item => {
                 // hLogger.debug('getEntriesByFilter', 'item=', item.title);
                 const name = encodeURIComponent(item.user);
-                if (this.elligibleName(item.user) && !this.checkCache(this._pwnedNamesCache[name])) {
-                    const fname = this.waitingNames.find(elem => elem.name === name);
-                    // hLogger.debug('fname=', fname);
-                    if (fname) fname.items.push(item);
-                    else this.waitingNames.push({ name: name, items: [item] });
+                if (this.elligibleName(item.user)) {
+                    if (this._isInCache('_pwnedNamesCache', name)) {
+                        const breaches = this._getCache('_pwnedNamesCache', name);
+                        refresh = refresh || HIBPUtils.xor(breaches, item.namePwned);
+                        item.namePwned = breaches;
+                    } else {
+                        const fname = this._waitingNames.find(elem => elem.name === name);
+                        if (fname) fname.items.push(item);
+                        else this._waitingNames.push({ name: name, items: [item] });
+                    }
                 }
                 let pwd = item.password;
                 if (pwd) {
@@ -642,55 +703,66 @@ class HIBP {
                         this.sha1(pwd)
                             .then(passwordHash => {
                                 passwordHash.toUpperCase();
-                                if (!this.checkCache(this._pwnedPwdsCache[passwordHash])) {
-                                    const fpwd = this.waitingPwds.find(elem => elem.pwd === pwd);
+                                if (this._isInCache('_pwnedPwdsCache', passwordHash)) {
+                                    const nb = this._getCache('_pwnedPwdsCache', passwordHash);
+                                    refresh = refresh || HIBPUtils.xor(nb, item.pwdPwned);
+                                    item.pwdPwned = nb;
+                                } else {
+                                    const fpwd = this._waitingPwds.find(elem => elem.pwd === pwd);
                                     if (fpwd) fpwd.items.push(item);
-                                    else this.waitingPwds.push({ pwd: pwd, items: [item] });
+                                    else this._waitingPwds.push({ pwd: pwd, items: [item] });
                                 }
                             });
                     }
                 };
             });
+            refresh && this._appModel.refresh();
         }
     }
     /**
-     * gets the first waiting elements (name and pwd) and start checking it
+     * Check waiting elements (name and pwd) until first one not already in cache.
      */
     checkNextWaitingElems() {
-        if (this.waitingNames.length) {
-            const elem = this.waitingNames.shift();
-            this.checkNamePwned(elem.name)
-                .then(breaches => {
-                    let refresh = false;
-                    elem.items.forEach(item => {
-                        const itemPwned = item.namePwned;
-                        item.namePwned = breaches;
-                        refresh = refresh || (!breaches !== !itemPwned); // XOR
+        let elem = null;
+        let inCache;
+        if (this._waitingNames.length) {
+            inCache = true; // true to take at least one elem
+            while (inCache && (elem = this._waitingNames.shift())) {
+                inCache = this._isInCache('_pwnedNamesCache', elem.name);
+                this.checkNamePwned(elem.name)
+                    .then(breaches => {
+                        let refresh = false;
+                        elem.items.forEach(item => {
+                            refresh = refresh || HIBPUtils.xor(breaches, item.namePwned);
+                            item.namePwned = breaches;
+                        });
+                        refresh && this._appModel.refresh();
+                    })
+                    .catch(err => {
+                        hLogger.error('error in checking name', elem.name, 'in checkNextWaitingElems', err);
                     });
-                    refresh && this.appModel.refresh();
-                })
-                .catch(err => {
-                    hLogger.error('error in checking name', elem.name, 'in checkNextWaitingElems', err);
-                });
+            }
         }
-        if (this.waitingPwds.length) {
-            const elem = this.waitingPwds.shift();
-            this.sha1(elem.pwd)
-                .then(hpwd => {
-                    return this.checkPwdPwned(hpwd);
-                })
-                .then(nb => {
-                    let refresh = false;
-                    elem.items.forEach(item => {
-                        const itemPwned = item.pwdPwned;
-                        item.pwdPwned = nb;
-                        refresh = refresh || (!nb !== !itemPwned); // XOR
+        if (this._waitingPwds.length) {
+            inCache = true;
+            while (inCache && (elem = this._waitingPwds.shift())) {
+                inCache = this._isInCache('_pwnedPwdsCache', elem.pwd);
+                this.sha1(elem.pwd)
+                    .then(hpwd => {
+                        return this.checkPwdPwned(hpwd);
+                    })
+                    .then(nb => {
+                        let refresh = false;
+                        elem.items.forEach(item => {
+                            refresh = refresh || HIBPUtils.xor(nb, item.pwdPwned);
+                            item.pwdPwned = nb;
+                        });
+                        refresh && this._appModel.refresh();
+                    })
+                    .catch(err => {
+                        hLogger.error('error in checking pwd', elem.pwd, 'in checkNextWaitingElems', err);
                     });
-                    refresh && this.appModel.refresh();
-                })
-                .catch(err => {
-                    hLogger.error('error in checking pwd', elem.pwd, 'in checkNextWaitingElems', err);
-                });
+            }
         }
     }
 };
@@ -736,9 +808,9 @@ ListView.prototype.render = function () {
     listViewRender.apply(this, arguments);
     hLogger.debug('rendering list in hibp');
     this.items.filter(item => item.namePwned || item.pwdPwned).forEach(item => {
-        hLogger.debug('list pwned item "' + item.title + '"');
+        // hLogger.debug('list pwned item "' + item.title + '"');
         const itemEl = document.getElementById(item.id);
-        if (itemEl) { itemEl.classList.add('hibp-pwned'); }
+        itemEl && itemEl.classList.add('hibp-pwned');
     });
 };
 
@@ -797,7 +869,7 @@ module.exports.setSettings = function (changes) {
     for (const field in changes) {
         const ccfield = field.substr(0, 1).toLowerCase() + field.substring(1);
         if (ccfield === 'debugMode') {
-            hLogger.setLevel(changes[field] ? HLoggerDebug : HLoggerDebug - 1);
+            hLogger.setLevel(changes[field] ? HLoggerDebug : HLoggerRegular);
         } else {
             hibp[ccfield] = changes[field];
         }
